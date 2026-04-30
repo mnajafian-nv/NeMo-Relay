@@ -36,12 +36,12 @@ plugins, and observability inside an agent system to follow one runtime model.
 
 NeMo Flow is not:
 
-- a model provider
-- a vector database
-- a hosted tracing service
-- a prompt authoring environment
-- a full agent framework or agent workbench
-- a replacement for application, framework, or provider SDK code
+- A model provider
+- A vector database
+- A hosted tracing service
+- A prompt authoring environment
+- A full agent framework or agent workbench
+- A replacement for application, framework, or provider SDK code
 
 It is the runtime layer that gives those systems shared execution scopes,
 middleware, lifecycle events, subscribers, plugins, and adaptive behavior.
@@ -519,8 +519,9 @@ Choose the smallest validation set that covers the touched surface:
 - Python binding changes: `uv run pytest`.
 - Node.js binding changes: `cd crates/node && npm test`.
 - Go binding changes: build the release FFI library first, then run Go tests under `go/nemo_flow`.
-- WebAssembly changes: run the WASM crate tests and
-  `wasm-pack test --node crates/wasm` when integration behavior changed.
+- WebAssembly changes: run `just test-wasm` and the WebAssembly crate tests
+  (`cargo test -p nemo-flow-wasm`) when integration behavior changed. For
+  focused debugging, you can run `wasm-pack test --node crates/wasm` directly.
 - Documentation changes: run `./scripts/build-docs.sh html`.
 
 Refer to [Testing and Documentation](../contribute/testing-and-docs.md) for the

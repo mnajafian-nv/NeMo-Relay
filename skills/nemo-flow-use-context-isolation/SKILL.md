@@ -45,17 +45,17 @@ ancestry and shared scope-local middleware.
   usage
 - **Node.js**: create and set a scope stack explicitly for the current execution
   path with `createScopeStack()` and `setThreadScopeStack(...)`
-- **WASM**: use `createScopeStack()` and `setThreadScopeStack(...)`;
+- **WebAssembly**: use `createScopeStack()` and `setThreadScopeStack(...)`;
   single-threaded execution does not remove the need for isolation between
   logical runs
 
 ## Common Failures
 
-- events from different requests appear under one root UUID
-- scope-local middleware leaks across requests
-- worker-thread work runs without the expected active scope
-- integrations activate NeMo Flow without an explicitly initialized stack
-- relying on a thread-local stack after crossing async tasks, goroutines, or JS
+- Events from different requests appear under one root UUID
+- Scope-local middleware leaks across requests
+- Worker-thread work runs without the expected active scope
+- Integrations activate NeMo Flow without an explicitly initialized stack
+- Relying on a thread-local stack after crossing async tasks, goroutines, or JS
   worker boundaries
 
 ## Related Skills

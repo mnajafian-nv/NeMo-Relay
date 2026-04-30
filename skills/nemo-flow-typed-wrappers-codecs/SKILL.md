@@ -24,7 +24,7 @@ tool or LLM integration.
   middleware, then converts JSON back into the framework callback or caller type.
 - Python exposes `JsonPassthrough`, `DataclassCodec`, `PydanticCodec`, and
   `BestEffortAnyCodec`. Node.js exposes `JsonPassthrough` plus custom
-  `Codec<T>` implementations. WASM has generated typed wrappers mirroring the
+  `Codec<T>` implementations. WebAssembly has generated typed wrappers mirroring the
   Node shape.
 - Use `BestEffortAnyCodec` only at boundaries where strict schemas are not
   available. Prefer dataclass, Pydantic, or explicit Node.js codecs when the
@@ -34,7 +34,7 @@ tool or LLM integration.
   inspect messages, tools, model names, generation parameters, and response
   annotations.
 - Built-in provider codecs include `OpenAIChatCodec`, `OpenAIResponsesCodec`,
-  and `AnthropicMessagesCodec` in Python, Node.js, WASM, and Rust. Choose the
+  and `AnthropicMessagesCodec` in Python, Node.js, WebAssembly, and Rust. Choose the
   codec that matches the actual provider payload shape.
 - Response codecs annotate LLM end events with fields such as `id`, `model`,
   `message`, `tool_calls`, `finish_reason`, `usage`, provider-specific data, and
@@ -45,19 +45,19 @@ tool or LLM integration.
 
 ## Key Rules
 
-- typed wrappers are currently a first-class path for Python and Node.js; WASM
+- Typed wrappers are currently a first-class path for Python and Node.js; WebAssembly
   exposes analogous generated JS wrappers; Rust uses codec traits directly
-- request/response conversion belongs in codecs
-- intercepts and guardrails see JSON values after encoding
-- changes made by middleware survive into the decode step
+- Request/response conversion belongs in codecs
+- Intercepts and guardrails see JSON values after encoding
+- Changes made by middleware survive into the decode step
 
 ## Choose A Codec
 
 - `JsonPassthrough` for JSON-native values
 - `DataclassCodec` or `PydanticCodec` in Python when the models already exist
-- custom codecs for domain-specific wire shapes
+- Custom codecs for domain-specific wire shapes
 - `BestEffortAnyCodec` only when broad flexibility is worth the looser contract
-- provider codecs for LLM provider payloads, not application domain object
+- Provider codecs for LLM provider payloads, not application domain objects
   conversion
 
 ## Validation Checklist

@@ -26,7 +26,7 @@ for example Arize Phoenix or another OpenInference-aware OTLP backend.
 - Configure `transport`, `endpoint`, `service_name`, optional namespace and
   version, instrumentation scope, headers, resource attributes, and timeout.
 - Start with `http_binary` transport and an OTLP/HTTP traces endpoint. Native
-  targets can use `grpc` only when a Tokio runtime is active; WASM rejects
+  targets can use `grpc` only when a Tokio runtime is active; WebAssembly rejects
   `grpc`.
 - Scope, tool, and LLM start inputs become `input.value`.
 - Scope, tool, and LLM end outputs become `output.value`.
@@ -38,17 +38,17 @@ for example Arize Phoenix or another OpenInference-aware OTLP backend.
 
 ## Important Semantics
 
-- spans include OpenInference semantic attributes
+- Spans include OpenInference semantic attributes
 - LLM spans derive `input.value` from request content, not request headers
-- scope types map to OpenInference span kinds
-- orphan mark events still export as zero-duration spans
+- Scope types map to OpenInference span kinds
+- Orphan mark events still export as zero-duration spans
 
 ## Troubleshooting Focus
 
-- no spans in the OpenInference-aware backend
-- expected semantic attributes missing
-- wrong scope types or no active scope
-- wrong OTLP transport for the chosen binding or target
+- No spans in the OpenInference-aware backend
+- Expected semantic attributes missing
+- Wrong scope types or no active scope
+- Wrong OTLP transport for the chosen binding or target
 
 ## Related Skills
 
