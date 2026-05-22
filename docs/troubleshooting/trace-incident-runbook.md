@@ -3,11 +3,11 @@ SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Production Incident Runbook
+# Trace Incident Runbook
 
-Use this runbook when a production NeMo Relay deployment has missing traces,
-partial traces, incorrect scope parentage, exporter failures, duplicate events,
-or sensitive data in telemetry. It assumes that the application already has a
+Use this runbook when a NeMo Relay application has missing traces, partial
+traces, incorrect scope parentage, exporter failures, duplicate events, or
+sensitive data in telemetry. It assumes that the application already has a
 baseline scope and call instrumentation path.
 
 For first-time setup problems, start with the
@@ -16,13 +16,13 @@ refer to [Agent Runtime Primer](../getting-started/agent-runtime-primer.md),
 [Scopes](../about/concepts/scopes.md), [Events](../about/concepts/events.md),
 and [Subscribers](../about/concepts/subscribers.md).
 
-## Protect Production Data First
+## Protect Sensitive Data First
 
 Do not collect raw prompts, model responses, authorization headers, tokens,
 customer records, tool arguments, or provider payloads while triaging an
 incident. Capture the smallest sanitized event sample that proves the failure.
 
-Before exporting incident artifacts outside the production environment, verify
+Before exporting incident artifacts outside the current trust boundary, verify
 that sanitize guardrails or exporter filters remove sensitive fields. Sanitize
 guardrails change emitted telemetry payloads only; they do not change the live
 request or response passed to the tool, model provider, or application. Refer to
@@ -39,7 +39,7 @@ Use this table to choose the first check for the symptom you see.
 | No traces | Missing instrumentation boundary or inactive exporter | [Confirm Instrumentation Boundary](#confirm-instrumentation-boundary) |
 | Partial traces | Unwrapped calls, dropped streams, or late subscriber registration | [Confirm Managed Calls](#confirm-managed-calls) |
 | Wrong parent or child scope | Scope propagation or shared scope stack issue | [Confirm Active Scope](#confirm-active-scope) |
-| Export works locally but not in production | Exporter config, endpoint, environment, or flush path | [Confirm Exporter Setup](#confirm-exporter-setup) |
+| Events appear in process but export fails elsewhere | Exporter config, endpoint, environment, or flush path | [Confirm Exporter Setup](#confirm-exporter-setup) |
 | Duplicate events | Duplicate subscribers, duplicate wrappers, or mixed manual and managed lifecycle calls | [Check For Duplicate Event Sources](#check-for-duplicate-event-sources) |
 | Sensitive data appears in telemetry | Missing sanitize guardrails before subscribers or exporters | [Confirm Sanitization Before Export](#confirm-sanitization-before-export) |
 
@@ -67,9 +67,9 @@ Start with the code path that owns the real work.
 - If a plugin installs runtime behavior, verify that the plugin is activated
   before the request path starts.
 
-Do not debug an exporter first if no local subscriber sees events. Add or enable
-a local, sanitized subscriber at the same boundary and confirm that scope, tool,
-or LLM events exist before investigating production export.
+Do not debug an exporter first if no in-process subscriber sees events. Add or
+enable a sanitized in-process subscriber at the same boundary and confirm that
+scope, tool, or LLM events exist before investigating external export.
 
 ## Confirm Active Scope
 
@@ -127,12 +127,12 @@ lifecycle.
 
 ## Confirm Exporter Setup
 
-If local event inspection works but production export fails, isolate exporter
-transport and configuration from runtime instrumentation.
+If in-process event inspection works but export fails elsewhere, isolate
+exporter transport and configuration from runtime instrumentation.
 
 For file or trajectory export, confirm these settings:
 
-- Output paths are writable by the production process.
+- Output paths are writable by the running process.
 - The application shuts down or clears the exporter in a path that flushes
   partial output.
 - ATIF export is scoped to the intended agent root and does not mix concurrent
@@ -141,7 +141,7 @@ For file or trajectory export, confirm these settings:
 For OpenTelemetry or OpenInference export, confirm these settings:
 
 - The OpenTelemetry Protocol (OTLP) endpoint, headers, credentials, and network
-  egress are available in the production environment.
+  egress are available in the target environment.
 - The exporter is enabled in the active configuration file or plugin document.
 - The backend receives spans with `nemo_relay.uuid` and
   `nemo_relay.parent_uuid` attributes.
@@ -173,15 +173,15 @@ the downstream backend distinguish attempts.
 
 ## Confirm Sanitization Before Export
 
-Sensitive data in telemetry is a production incident. Use this order:
+Sensitive data in telemetry is an incident. Use this order:
 
 1. Stop or disable the affected exporter if sensitive data is leaving the
-   production trust boundary.
+   intended trust boundary.
 2. Keep the application path stable unless the live request itself is unsafe.
 3. Add or fix sanitize-request and sanitize-response guardrails before
-   production subscribers and exporters receive events.
-4. Validate the sanitized event locally with ATOF JSONL or an in-process
-   subscriber before re-enabling external export.
+   subscribers and exporters receive events.
+4. Validate the sanitized event with ATOF JSONL or an in-process subscriber
+   before re-enabling external export.
 5. Re-enable one exporter at a time and confirm the downstream backend no
    longer receives sensitive fields.
 
@@ -199,12 +199,12 @@ Collect this information before escalating an incident:
 - Exporter type, configuration source, and activation path.
 - Sanitized event sample that shows `uuid`, `parent_uuid`, `category`,
   `scope_category`, name, and redacted metadata.
-- Deployment shape, such as single process, worker pool, async tasks, sidecar,
-  job queue, or container orchestration.
+- Runtime shape, such as single process, worker pool, async tasks, sidecar, job
+  queue, or container orchestration.
 - Reproduction scope, including whether the failure occurs for one request, one
-  tenant, one service, or all production traffic.
+  tenant, one service, or all requests.
 - Recent changes to instrumentation, plugin configuration, exporter endpoints,
-  deployment environment, or tracing backend configuration.
+  runtime environment, or tracing backend configuration.
 
 Do not attach raw prompts, model responses, credentials, customer records,
 authorization headers, or unredacted tool arguments to escalation artifacts.
