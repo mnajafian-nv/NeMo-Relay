@@ -199,12 +199,27 @@ pub struct AtifSectionConfig {
     /// Extra ATIF agent metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra: Option<Json>,
-    /// Directory containing trajectory JSON files.
+    /// Directory containing trajectory JSON files. Ignored when [`storage`] is non-empty.
+    ///
+    /// [`storage`]: Self::storage
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_directory: Option<PathBuf>,
     /// Filename template. `{session_id}` is replaced with the top-level trajectory scope UUID.
+    /// When [`storage`] is non-empty, the rendered filename is appended to each backend's key prefix.
+    ///
+    /// [`storage`]: Self::storage
     #[serde(default = "default_atif_filename_template")]
     pub filename_template: String,
+    /// Optional list of remote storage destinations. When non-empty, completed
+    /// trajectories are uploaded to every configured backend instead of being
+    /// written locally; the local file write at [`output_directory`] is
+    /// skipped. Backends are independent: an upload failure on one destination
+    /// is recorded against that destination and skipped on subsequent
+    /// trajectories, while the other destinations continue to receive writes.
+    ///
+    /// [`output_directory`]: Self::output_directory
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage: Vec<AtifStorageConfig>,
 }
 
 impl Default for AtifSectionConfig {
@@ -218,8 +233,76 @@ impl Default for AtifSectionConfig {
             extra: None,
             output_directory: None,
             filename_template: default_atif_filename_template(),
+            storage: Vec::new(),
         }
     }
+}
+
+/// Remote storage destination for ATIF trajectory files.
+///
+/// When [`AtifSectionConfig::storage`] is non-empty, the ATIF dispatcher
+/// uploads each completed trajectory to every configured backend instead of
+/// writing it to the local filesystem. The shape is tagged with a `type`
+/// discriminator so additional backends (for example, Azure Blob Storage) can
+/// be added without breaking existing configs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AtifStorageConfig {
+    /// S3-compatible object storage.
+    ///
+    /// Non-secret connection settings (`region`, `endpoint_url`, `allow_http`)
+    /// and the static `access_key_id` may be set directly. The secret
+    /// credential fields (`secret_access_key_var`, `session_token_var`) must
+    /// reference the *name* of an environment variable that holds the secret,
+    /// so multiple S3 destinations can coexist in one config without writing
+    /// secrets into checked-in files. Any field left unset falls back to the
+    /// matching `AWS_*` environment variable (`AWS_ACCESS_KEY_ID`,
+    /// `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`,
+    /// `AWS_ENDPOINT_URL`, `AWS_ALLOW_HTTP`).
+    S3(S3StorageConfig),
+}
+
+/// S3-compatible storage settings for ATIF trajectory upload.
+///
+/// Every connection field is optional. Unset fields fall back to the matching
+/// `AWS_*` environment variable, preserving the env-driven workflow while
+/// letting one config file fully describe a destination when needed. Secret
+/// credentials are referenced by env var *name* (the `_var` suffix), so
+/// multiple destinations can each carry their own credentials without leaking
+/// secret material into the config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct S3StorageConfig {
+    /// Destination bucket name. Must be non-empty.
+    pub bucket: String,
+    /// Optional key prefix applied to every uploaded object. A trailing `/` is
+    /// inserted automatically when one is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_prefix: Option<String>,
+    /// Static AWS access key ID. When unset, `AWS_ACCESS_KEY_ID` is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
+    /// Name of the environment variable that holds the static secret access
+    /// key. Validated to be non-empty and present at plugin initialization
+    /// time. When unset, `AWS_SECRET_ACCESS_KEY` is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_access_key_var: Option<String>,
+    /// Name of the environment variable that holds the optional STS session
+    /// token. Validated to be non-empty and present at plugin initialization
+    /// time. When unset, `AWS_SESSION_TOKEN` is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token_var: Option<String>,
+    /// AWS region for the bucket. When unset, `AWS_REGION` is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// Endpoint URL override for S3-compatible storage (for example, MinIO).
+    /// When unset, `AWS_ENDPOINT_URL` is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_url: Option<String>,
+    /// Allow plain HTTP endpoints. When unset, `AWS_ALLOW_HTTP` is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_http: Option<bool>,
 }
 
 /// Shared OTLP exporter config for OpenTelemetry and OpenInference.
@@ -338,6 +421,7 @@ crate::editor_config! {
         extra => { label: "extra", kind: Json, optional: true },
         output_directory => { label: "output_directory", kind: String, optional: true },
         filename_template => { label: "filename_template", kind: String },
+        storage => { label: "storage", kind: Json, optional: true },
     }
 }
 
@@ -495,6 +579,8 @@ fn register_atof_exporter(
     Ok(())
 }
 
+type AtifStorageList = Arc<Vec<Arc<AtifRemoteStorage>>>;
+
 fn register_atif_dispatcher(
     section: AtifSectionConfig,
     ctx: &mut PluginRegistrationContext,
@@ -505,9 +591,20 @@ fn register_atif_dispatcher(
         ));
     }
 
+    let mut storage_vec = Vec::with_capacity(section.storage.len());
+    for (index, entry) in section.storage.iter().enumerate() {
+        storage_vec.push(build_atif_storage(index, entry)?);
+    }
+    let storage: AtifStorageList = Arc::new(storage_vec);
+
     let manager = Arc::new(Mutex::new(AtifDispatcher::new(section)));
-    let dispatcher = atif_dispatcher_subscriber(Arc::clone(&manager), ctx.qualify_name("atif-"));
+    let dispatcher = atif_dispatcher_subscriber(
+        Arc::clone(&manager),
+        ctx.qualify_name("atif-"),
+        Arc::clone(&storage),
+    );
     ctx.register_subscriber("atif", dispatcher)?;
+    let shutdown_storage = Arc::clone(&storage);
     ctx.add_registration(PluginRegistration::new(
         "observability",
         ctx.qualify_name("atif.shutdown"),
@@ -525,13 +622,17 @@ fn register_atif_dispatcher(
             }
             for write in work.writes {
                 let agent_uuid = write.agent_uuid;
-                let result = write_atif_file(&write);
+                let targets = {
+                    let guard = manager.lock().map_err(|err| {
+                        PluginError::Internal(format!("ATIF dispatcher lock poisoned: {err}"))
+                    })?;
+                    guard.sink_targets()
+                };
+                let results = write_atif(&write, shutdown_storage.as_slice(), &targets);
                 let mut guard = manager.lock().map_err(|err| {
                     PluginError::Internal(format!("ATIF dispatcher lock poisoned: {err}"))
                 })?;
-                guard
-                    .finish_agent_write(agent_uuid, result)
-                    .map_err(observability_registration_error)?;
+                let _ = guard.complete_scope_write(agent_uuid, results);
             }
             let guard = manager.lock().map_err(|err| {
                 PluginError::Internal(format!("ATIF dispatcher lock poisoned: {err}"))
@@ -542,6 +643,26 @@ fn register_atif_dispatcher(
         }),
     ));
     Ok(())
+}
+
+#[cfg(all(feature = "object-store", not(target_arch = "wasm32")))]
+fn build_atif_storage(
+    index: usize,
+    config: &AtifStorageConfig,
+) -> PluginResult<Arc<AtifRemoteStorage>> {
+    AtifRemoteStorage::from_config(index, config)
+        .map(Arc::new)
+        .map_err(observability_registration_error)
+}
+
+#[cfg(not(all(feature = "object-store", not(target_arch = "wasm32"))))]
+fn build_atif_storage(
+    _index: usize,
+    _config: &AtifStorageConfig,
+) -> PluginResult<Arc<AtifRemoteStorage>> {
+    Err(PluginError::InvalidConfig(
+        "ATIF storage support is not enabled in this build".to_string(),
+    ))
 }
 
 #[cfg(feature = "otel")]
@@ -613,12 +734,20 @@ struct AtifDispatcher {
     agents: HashMap<Uuid, ManagedAtifExporter>,
     scope_owners: HashMap<Uuid, Uuid>,
     scope_subscribers: HashMap<Uuid, String>,
-    last_error: Option<String>,
+    /// Fatal dispatcher errors (subscriber registration, payload serialization)
+    /// that cannot be isolated to a single sink. Once set, the dispatcher stops
+    /// observing further events.
+    fatal_error: Option<String>,
+    /// Per-sink last error. A sink that recorded an error is skipped on
+    /// subsequent trajectories; other sinks continue to receive writes. Errors
+    /// here are surfaced together by [`last_error_result`] on teardown.
+    sink_errors: HashMap<SinkLabel, String>,
 }
 
 struct ManagedAtifExporter {
     exporter: AtifExporter,
-    path: PathBuf,
+    filename: String,
+    local_path: Option<PathBuf>,
     observed_events: Vec<Event>,
     observed_event_keys: HashSet<String>,
     written: bool,
@@ -626,13 +755,45 @@ struct ManagedAtifExporter {
 
 struct PendingAtifWrite {
     agent_uuid: Uuid,
-    path: PathBuf,
+    // `filename` is consumed by the remote upload path, which is gated on the
+    // object-store feature; without it, only the local sink reads `local_path`.
+    #[cfg_attr(
+        not(all(feature = "object-store", not(target_arch = "wasm32"))),
+        allow(dead_code)
+    )]
+    filename: String,
+    local_path: Option<PathBuf>,
     payload: Vec<u8>,
 }
 
 struct AtifFlushWork {
     writes: Vec<PendingAtifWrite>,
     scope_subscribers: Vec<(Uuid, String)>,
+}
+
+/// Identifier for a single output sink. `Local` is used when `storage` is empty
+/// (the legacy local-file path); `Remote(i)` indexes into the configured
+/// storage backends.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SinkLabel {
+    Local,
+    Remote(usize),
+}
+
+impl SinkLabel {
+    fn display(&self) -> String {
+        match self {
+            SinkLabel::Local => "local".to_string(),
+            SinkLabel::Remote(index) => format!("storage[{index}]"),
+        }
+    }
+
+    fn sort_key(&self) -> isize {
+        match self {
+            SinkLabel::Local => -1,
+            SinkLabel::Remote(index) => *index as isize,
+        }
+    }
 }
 
 impl AtifDispatcher {
@@ -642,7 +803,8 @@ impl AtifDispatcher {
             agents: HashMap::new(),
             scope_owners: HashMap::new(),
             scope_subscribers: HashMap::new(),
-            last_error: None,
+            fatal_error: None,
+            sink_errors: HashMap::new(),
         }
     }
 
@@ -651,8 +813,9 @@ impl AtifDispatcher {
         event: &Event,
         subscriber_prefix: &str,
         state: Arc<Mutex<Self>>,
-    ) -> Option<PendingAtifWrite> {
-        if self.last_error.is_some() {
+        storage: AtifStorageList,
+    ) -> Option<(PendingAtifWrite, Vec<SinkLabel>)> {
+        if self.fatal_error.is_some() {
             return None;
         }
 
@@ -671,13 +834,14 @@ impl AtifDispatcher {
         let session_id = event.uuid().to_string();
         let exporter = AtifExporter::new(session_id.clone(), self.agent_info());
         (exporter.subscriber())(event);
-        let path = self.output_path(&session_id);
+        let (filename, local_path) = self.prepare_destination(&session_id);
         self.scope_owners.insert(event.uuid(), event.uuid());
         self.agents.insert(
             event.uuid(),
             ManagedAtifExporter {
                 exporter,
-                path,
+                filename,
+                local_path,
                 observed_events: vec![event.clone()],
                 observed_event_keys: HashSet::from([event_observation_key(event)]),
                 written: false,
@@ -686,18 +850,21 @@ impl AtifDispatcher {
 
         let agent_uuid = event.uuid();
         let name = format!("{subscriber_prefix}{agent_uuid}");
-        let callback = atif_scope_subscriber(state, agent_uuid);
+        let callback = atif_scope_subscriber(state, agent_uuid, storage);
         // Attach the scoped subscriber to the trajectory root rather than the
         // global registry so sibling top-level trajectories never share events.
         if let Err(err) = scope_register_subscriber(&agent_uuid, &name, callback) {
-            self.last_error = Some(format!("failed to register ATIF scope subscriber: {err}"));
+            self.fatal_error = Some(format!("failed to register ATIF scope subscriber: {err}"));
         } else {
             self.scope_subscribers.insert(agent_uuid, name);
         }
         None
     }
 
-    fn observe_descendant_from_global(&mut self, event: &Event) -> Option<PendingAtifWrite> {
+    fn observe_descendant_from_global(
+        &mut self,
+        event: &Event,
+    ) -> Option<(PendingAtifWrite, Vec<SinkLabel>)> {
         let owner = self.scope_owners.get(&event.uuid()).copied().or_else(|| {
             event
                 .parent_uuid()
@@ -717,8 +884,12 @@ impl AtifDispatcher {
         pending_write
     }
 
-    fn observe_scope(&mut self, event: &Event, agent_uuid: Uuid) -> Option<PendingAtifWrite> {
-        if self.last_error.is_some() {
+    fn observe_scope(
+        &mut self,
+        event: &Event,
+        agent_uuid: Uuid,
+    ) -> Option<(PendingAtifWrite, Vec<SinkLabel>)> {
+        if self.fatal_error.is_some() {
             return None;
         }
         let should_finalize =
@@ -735,22 +906,29 @@ impl AtifDispatcher {
         if !should_finalize || agent.written {
             return None;
         }
-        match prepare_atif_file(agent_uuid, agent) {
-            Ok(write) => Some(write),
+        let write = match prepare_atif_file(agent_uuid, agent) {
+            Ok(write) => write,
             Err(err) => {
-                self.last_error = Some(err.to_string());
-                None
+                self.fatal_error = Some(err.to_string());
+                return None;
             }
-        }
+        };
+        let targets = self.sink_targets();
+        Some((write, targets))
     }
 
     fn complete_scope_write(
         &mut self,
         agent_uuid: Uuid,
-        result: std::io::Result<()>,
+        results: Vec<(SinkLabel, std::io::Result<()>)>,
     ) -> Option<(Uuid, String)> {
-        if self.finish_agent_write(agent_uuid, result).is_err() {
-            return None;
+        for (label, result) in results {
+            if let Err(err) = result {
+                self.sink_errors.insert(label, err.to_string());
+            }
+        }
+        if let Some(agent) = self.agents.get_mut(&agent_uuid) {
+            agent.observed_events.clear();
         }
         self.agents.remove(&agent_uuid);
         self.scope_owners.retain(|_, owner| *owner != agent_uuid);
@@ -783,33 +961,21 @@ impl AtifDispatcher {
         })
     }
 
-    fn finish_agent_write(
-        &mut self,
-        agent_uuid: Uuid,
-        result: std::io::Result<()>,
-    ) -> std::io::Result<()> {
-        match result {
-            Ok(()) => {
-                if let Some(agent) = self.agents.get_mut(&agent_uuid) {
-                    agent.observed_events.clear();
-                }
-                Ok(())
-            }
-            Err(err) => {
-                if let Some(agent) = self.agents.get_mut(&agent_uuid) {
-                    agent.written = false;
-                }
-                self.last_error = Some(err.to_string());
-                Err(err)
-            }
-        }
-    }
-
     fn last_error_result(&self) -> std::io::Result<()> {
-        if let Some(message) = &self.last_error {
-            return Err(std::io::Error::other(message.clone()));
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(message) = &self.fatal_error {
+            parts.push(message.clone());
         }
-        Ok(())
+        let mut sink_entries: Vec<_> = self.sink_errors.iter().collect();
+        sink_entries.sort_by_key(|(label, _)| label.sort_key());
+        for (label, message) in sink_entries {
+            parts.push(format!("{}: {message}", label.display()));
+        }
+        if parts.is_empty() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(parts.join("; ")))
+        }
     }
 
     fn agent_info(&self) -> AtifAgentInfo {
@@ -822,40 +988,65 @@ impl AtifDispatcher {
         }
     }
 
-    fn output_path(&self, session_id: &str) -> PathBuf {
+    fn prepare_destination(&self, session_id: &str) -> (String, Option<PathBuf>) {
+        let filename = self
+            .config
+            .filename_template
+            .replace("{session_id}", session_id);
+        if !self.config.storage.is_empty() {
+            return (filename, None);
+        }
         let directory = self
             .config
             .output_directory
             .clone()
             .unwrap_or_else(default_output_directory);
-        let filename = self
-            .config
-            .filename_template
-            .replace("{session_id}", session_id);
-        directory.join(filename)
+        let path = directory.join(&filename);
+        (filename, Some(path))
+    }
+
+    fn sink_targets(&self) -> Vec<SinkLabel> {
+        if self.config.storage.is_empty() {
+            if self.sink_errors.contains_key(&SinkLabel::Local) {
+                Vec::new()
+            } else {
+                vec![SinkLabel::Local]
+            }
+        } else {
+            (0..self.config.storage.len())
+                .map(SinkLabel::Remote)
+                .filter(|label| !self.sink_errors.contains_key(label))
+                .collect()
+        }
     }
 }
 
 fn atif_dispatcher_subscriber(
     manager: Arc<Mutex<AtifDispatcher>>,
     subscriber_prefix: String,
+    storage: AtifStorageList,
 ) -> EventSubscriberFn {
     Arc::new(move |event: &Event| {
-        let pending_write = {
+        let pending = {
             let Ok(mut guard) = manager.lock() else {
                 return;
             };
-            guard.observe_global(event, &subscriber_prefix, Arc::clone(&manager))
+            guard.observe_global(
+                event,
+                &subscriber_prefix,
+                Arc::clone(&manager),
+                Arc::clone(&storage),
+            )
         };
-        let Some(write) = pending_write else {
+        let Some((write, targets)) = pending else {
             return;
         };
-        let result = write_atif_file(&write);
+        let results = write_atif(&write, storage.as_slice(), &targets);
         let scope_subscriber = {
             let Ok(mut guard) = manager.lock() else {
                 return;
             };
-            guard.complete_scope_write(write.agent_uuid, result)
+            guard.complete_scope_write(write.agent_uuid, results)
         };
         if let Some((scope_uuid, name)) = scope_subscriber {
             let _ = scope_deregister_subscriber(&scope_uuid, &name);
@@ -866,23 +1057,24 @@ fn atif_dispatcher_subscriber(
 fn atif_scope_subscriber(
     manager: Arc<Mutex<AtifDispatcher>>,
     agent_uuid: Uuid,
+    storage: AtifStorageList,
 ) -> EventSubscriberFn {
     Arc::new(move |event: &Event| {
-        let pending_write = {
+        let pending = {
             let Ok(mut guard) = manager.lock() else {
                 return;
             };
             guard.observe_scope(event, agent_uuid)
         };
-        let Some(write) = pending_write else {
+        let Some((write, targets)) = pending else {
             return;
         };
-        let result = write_atif_file(&write);
+        let results = write_atif(&write, storage.as_slice(), &targets);
         let scope_subscriber = {
             let Ok(mut guard) = manager.lock() else {
                 return;
             };
-            guard.complete_scope_write(write.agent_uuid, result)
+            guard.complete_scope_write(write.agent_uuid, results)
         };
         if let Some((scope_uuid, name)) = scope_subscriber {
             let _ = scope_deregister_subscriber(&scope_uuid, &name);
@@ -908,17 +1100,62 @@ fn prepare_atif_file(
     agent.written = true;
     Ok(PendingAtifWrite {
         agent_uuid,
-        path: agent.path.clone(),
+        filename: agent.filename.clone(),
+        local_path: agent.local_path.clone(),
         payload,
     })
 }
 
-fn write_atif_file(write: &PendingAtifWrite) -> std::io::Result<()> {
-    if let Some(parent) = write.path.parent() {
+fn write_atif(
+    write: &PendingAtifWrite,
+    storage: &[Arc<AtifRemoteStorage>],
+    targets: &[SinkLabel],
+) -> Vec<(SinkLabel, std::io::Result<()>)> {
+    targets
+        .iter()
+        .map(|label| {
+            let result = match label {
+                SinkLabel::Local => match &write.local_path {
+                    Some(path) => write_atif_local(path, &write.payload),
+                    None => Err(std::io::Error::other(
+                        "ATIF local destination has no output path",
+                    )),
+                },
+                SinkLabel::Remote(index) => write_atif_remote(storage, *index, write),
+            };
+            (label.clone(), result)
+        })
+        .collect()
+}
+
+fn write_atif_local(path: &PathBuf, payload: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&write.path, &write.payload)?;
-    Ok(())
+    std::fs::write(path, payload)
+}
+
+#[cfg(all(feature = "object-store", not(target_arch = "wasm32")))]
+fn write_atif_remote(
+    storage: &[Arc<AtifRemoteStorage>],
+    index: usize,
+    write: &PendingAtifWrite,
+) -> std::io::Result<()> {
+    let sink = storage
+        .get(index)
+        .ok_or_else(|| std::io::Error::other(format!("ATIF storage[{index}] is not registered")))?;
+    sink.put(&write.filename, &write.payload)
+}
+
+#[cfg(not(all(feature = "object-store", not(target_arch = "wasm32"))))]
+fn write_atif_remote(
+    _storage: &[Arc<AtifRemoteStorage>],
+    _index: usize,
+    _write: &PendingAtifWrite,
+) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "ATIF storage support is not enabled in this build",
+    ))
 }
 
 fn event_observation_key(event: &Event) -> String {
@@ -1080,6 +1317,7 @@ fn validate_observability_plugin_config(
             "extra",
             "output_directory",
             "filename_template",
+            "storage",
         ],
     );
     validate_section_fields(
@@ -1144,6 +1382,17 @@ fn validate_observability_plugin_config(
                 Some("atif".to_string()),
                 Some("enabled".to_string()),
                 "ATIF file export is not supported on WebAssembly".to_string(),
+            );
+        }
+        #[cfg(not(all(feature = "object-store", not(target_arch = "wasm32"))))]
+        if !section.storage.is_empty() {
+            push_policy_diag(
+                &mut diagnostics,
+                config.policy.unsupported_value,
+                "observability.feature_disabled",
+                Some("atif".to_string()),
+                Some("storage".to_string()),
+                "ATIF storage support is not enabled in this build".to_string(),
             );
         }
     }
@@ -1258,6 +1507,104 @@ fn validate_atif_values(
             "ATIF filename_template must contain '{session_id}'".to_string(),
         );
     }
+    for (index, storage) in section.storage.iter().enumerate() {
+        validate_atif_storage_values(diagnostics, policy, index, storage);
+    }
+}
+
+fn validate_atif_storage_values(
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    policy: &ConfigPolicy,
+    index: usize,
+    storage: &AtifStorageConfig,
+) {
+    match storage {
+        AtifStorageConfig::S3(s3) => {
+            if s3.bucket.trim().is_empty() {
+                push_policy_diag(
+                    diagnostics,
+                    policy.unsupported_value,
+                    "observability.unsupported_value",
+                    Some("atif".to_string()),
+                    Some(format!("storage[{index}].bucket")),
+                    format!("ATIF storage[{index}].bucket must be non-empty"),
+                );
+            }
+            validate_atif_storage_env_var(
+                diagnostics,
+                policy,
+                &format!("storage[{index}].secret_access_key_var"),
+                s3.secret_access_key_var.as_deref(),
+            );
+            validate_atif_storage_env_var(
+                diagnostics,
+                policy,
+                &format!("storage[{index}].session_token_var"),
+                s3.session_token_var.as_deref(),
+            );
+        }
+    }
+}
+
+fn validate_atif_storage_env_var(
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    policy: &ConfigPolicy,
+    field: &str,
+    var_name: Option<&str>,
+) {
+    let Some(var_name) = var_name else {
+        return;
+    };
+    let trimmed = var_name.trim();
+    if trimmed.is_empty() {
+        push_policy_diag(
+            diagnostics,
+            policy.unsupported_value,
+            "observability.unsupported_value",
+            Some("atif".to_string()),
+            Some(field.to_string()),
+            format!("ATIF {field} must be the name of an environment variable, not empty"),
+        );
+        return;
+    }
+    if trimmed != var_name {
+        push_policy_diag(
+            diagnostics,
+            policy.unsupported_value,
+            "observability.unsupported_value",
+            Some("atif".to_string()),
+            Some(field.to_string()),
+            format!("ATIF {field} must not have surrounding whitespace; got '{var_name}'"),
+        );
+        return;
+    }
+    match std::env::var(var_name) {
+        Ok(value) if !value.is_empty() => {}
+        Ok(_) => {
+            push_policy_diag(
+                diagnostics,
+                policy.unsupported_value,
+                "observability.unsupported_value",
+                Some("atif".to_string()),
+                Some(field.to_string()),
+                format!(
+                    "ATIF {field}='{var_name}' references an environment variable that is set but empty"
+                ),
+            );
+        }
+        Err(_) => {
+            push_policy_diag(
+                diagnostics,
+                policy.unsupported_value,
+                "observability.unsupported_value",
+                Some("atif".to_string()),
+                Some(field.to_string()),
+                format!(
+                    "ATIF {field}='{var_name}' references an environment variable that is not set"
+                ),
+            );
+        }
+    }
 }
 
 fn validate_otlp_values(
@@ -1367,6 +1714,220 @@ fn default_timeout_millis() -> u64 {
 
 fn default_output_directory() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+#[cfg(not(all(feature = "object-store", not(target_arch = "wasm32"))))]
+struct AtifRemoteStorage;
+
+/// Remote storage handle for ATIF trajectory uploads.
+///
+/// The handle owns a dedicated OS thread that runs a single-threaded tokio
+/// runtime. Subscriber callbacks (which run on the runtime that emitted the
+/// event) submit uploads over a synchronous channel and block on the reply, so
+/// the handle stays safe to drive from any thread regardless of whether the
+/// caller is already inside another tokio runtime.
+#[cfg(all(feature = "object-store", not(target_arch = "wasm32")))]
+struct AtifRemoteStorage {
+    sender: std::sync::mpsc::Sender<AtifUploadRequest>,
+    key_prefix: String,
+}
+
+#[cfg(all(feature = "object-store", not(target_arch = "wasm32")))]
+struct AtifUploadRequest {
+    key: String,
+    payload: Vec<u8>,
+    reply: std::sync::mpsc::Sender<std::io::Result<()>>,
+}
+
+#[cfg(all(feature = "object-store", not(target_arch = "wasm32")))]
+#[derive(Default)]
+struct S3BuilderOverrides {
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    session_token: Option<String>,
+    region: Option<String>,
+    endpoint_url: Option<String>,
+    allow_http: Option<bool>,
+}
+
+#[cfg(all(feature = "object-store", not(target_arch = "wasm32")))]
+impl S3BuilderOverrides {
+    fn resolve(index: usize, s3: &S3StorageConfig) -> std::io::Result<Self> {
+        Ok(Self {
+            access_key_id: s3.access_key_id.clone(),
+            secret_access_key: resolve_env_var_field(
+                &format!("storage[{index}].secret_access_key_var"),
+                s3.secret_access_key_var.as_deref(),
+            )?,
+            session_token: resolve_env_var_field(
+                &format!("storage[{index}].session_token_var"),
+                s3.session_token_var.as_deref(),
+            )?,
+            region: s3.region.clone(),
+            endpoint_url: s3.endpoint_url.clone(),
+            allow_http: s3.allow_http,
+        })
+    }
+
+    fn apply(
+        self,
+        mut builder: object_store::aws::AmazonS3Builder,
+    ) -> object_store::aws::AmazonS3Builder {
+        if let Some(value) = self.access_key_id {
+            builder = builder.with_access_key_id(value);
+        }
+        if let Some(value) = self.secret_access_key {
+            builder = builder.with_secret_access_key(value);
+        }
+        if let Some(value) = self.session_token {
+            builder = builder.with_token(value);
+        }
+        if let Some(value) = self.region {
+            builder = builder.with_region(value);
+        }
+        if let Some(value) = self.endpoint_url {
+            builder = builder.with_endpoint(value);
+        }
+        if let Some(value) = self.allow_http {
+            builder = builder.with_allow_http(value);
+        }
+        builder
+    }
+}
+
+#[cfg(all(feature = "object-store", not(target_arch = "wasm32")))]
+fn resolve_env_var_field(field: &str, var_name: Option<&str>) -> std::io::Result<Option<String>> {
+    let Some(var_name) = var_name else {
+        return Ok(None);
+    };
+    if var_name.trim().is_empty() || var_name.trim() != var_name {
+        return Err(std::io::Error::other(format!(
+            "ATIF {field} must be the name of an environment variable, not '{var_name}'"
+        )));
+    }
+    match std::env::var(var_name) {
+        Ok(value) if !value.is_empty() => Ok(Some(value)),
+        Ok(_) => Err(std::io::Error::other(format!(
+            "ATIF {field}='{var_name}' references an environment variable that is set but empty"
+        ))),
+        Err(_) => Err(std::io::Error::other(format!(
+            "ATIF {field}='{var_name}' references an environment variable that is not set"
+        ))),
+    }
+}
+
+#[cfg(all(feature = "object-store", not(target_arch = "wasm32")))]
+impl AtifRemoteStorage {
+    fn from_config(index: usize, config: &AtifStorageConfig) -> std::io::Result<Self> {
+        match config {
+            AtifStorageConfig::S3(s3) => Self::build_s3(index, s3),
+        }
+    }
+
+    fn build_s3(index: usize, s3: &S3StorageConfig) -> std::io::Result<Self> {
+        let bucket = s3.bucket.clone();
+        let key_prefix = normalize_storage_key_prefix(s3.key_prefix.as_deref());
+        let overrides = S3BuilderOverrides::resolve(index, s3)?;
+
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<AtifUploadRequest>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
+
+        std::thread::Builder::new()
+            .name("nemo-relay-atif-storage".to_string())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(std::io::Error::other(format!(
+                            "failed to build ATIF storage runtime: {err}"
+                        ))));
+                        return;
+                    }
+                };
+                let store = match overrides
+                    .apply(object_store::aws::AmazonS3Builder::from_env())
+                    .with_bucket_name(&bucket)
+                    .build()
+                {
+                    Ok(store) => Arc::new(store) as Arc<dyn object_store::ObjectStore>,
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(std::io::Error::other(format!(
+                            "failed to build S3 client for bucket '{bucket}': {err}"
+                        ))));
+                        return;
+                    }
+                };
+                if ready_tx.send(Ok(())).is_err() {
+                    return;
+                }
+                drop(ready_tx);
+
+                while let Ok(request) = req_rx.recv() {
+                    let result = runtime.block_on(async {
+                        use object_store::ObjectStoreExt as _;
+                        store
+                            .put(
+                                &object_store::path::Path::from(request.key.clone()),
+                                object_store::PutPayload::from(request.payload),
+                            )
+                            .await
+                            .map(|_| ())
+                            .map_err(|err| {
+                                std::io::Error::other(format!(
+                                    "S3 upload to '{}' failed: {err}",
+                                    request.key
+                                ))
+                            })
+                    });
+                    let _ = request.reply.send(result);
+                }
+            })
+            .map_err(|err| {
+                std::io::Error::other(format!("failed to spawn ATIF storage thread: {err}"))
+            })?;
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                sender: req_tx,
+                key_prefix,
+            }),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(std::io::Error::other(
+                "ATIF storage thread exited before signalling readiness",
+            )),
+        }
+    }
+
+    fn put(&self, filename: &str, payload: &[u8]) -> std::io::Result<()> {
+        let key = format!("{}{}", self.key_prefix, filename);
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.sender
+            .send(AtifUploadRequest {
+                key,
+                payload: payload.to_vec(),
+                reply: reply_tx,
+            })
+            .map_err(|_| std::io::Error::other("ATIF storage thread is not running"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| std::io::Error::other("ATIF storage thread dropped the upload reply"))?
+    }
+}
+
+#[cfg(all(feature = "object-store", not(target_arch = "wasm32")))]
+fn normalize_storage_key_prefix(raw: Option<&str>) -> String {
+    let trimmed = raw.unwrap_or("").trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.ends_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/")
+    }
 }
 
 #[cfg(test)]
