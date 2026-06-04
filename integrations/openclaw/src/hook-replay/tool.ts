@@ -22,12 +22,14 @@ export async function guardBeforeToolCall(
   event: PluginHookBeforeToolCallEvent,
   ctx: PluginHookToolContext,
 ): Promise<void> {
+  const observedAtMicros = nowMicros();
   const session = ensureSession(manager, {
     sessionId: ctx.sessionId,
     sessionKey: ctx.sessionKey,
     runId: event.runId ?? ctx.runId,
     agentId: ctx.agentId,
     source: 'lazy_session',
+    timestamp: observedAtMicros,
   });
   const args = toJsonValue(event.params ?? {});
 
@@ -50,12 +52,14 @@ export function replayAfterToolCall(
   event: PluginHookAfterToolCallEvent,
   ctx: PluginHookToolContext,
 ): void {
+  const observedAtMicros = nowMicros();
   const session = ensureSession(manager, {
     sessionId: ctx.sessionId,
     sessionKey: ctx.sessionKey,
     runId: event.runId ?? ctx.runId,
     agentId: ctx.agentId,
     source: 'lazy_session',
+    timestamp: observedAtMicros,
   });
 
   const blockedDetails = blockedToolDetails(event, { runId: event.runId ?? ctx.runId });
@@ -76,6 +80,7 @@ export function replayAfterToolCall(
           runId: event.runId ?? ctx.runId,
           toolCallId: event.toolCallId ?? ctx.toolCallId,
         }),
+        timestamp: observedAtMicros,
       });
     });
     return;

@@ -10,7 +10,7 @@
  */
 import type { NemoRelayHookBackendConfig } from './config.js';
 import { emitMark, toJsonRecord } from './hook-replay/marks.js';
-import { llmKey } from './hook-replay/correlation.js';
+import { llmKey, nowMicros } from './hook-replay/correlation.js';
 import {
   emitUnpairedModelCallTimingMarks,
   recordBeforeMessageWrite,
@@ -28,7 +28,9 @@ import {
   closeSessionRoot,
   deleteSession,
   ensureSession,
-  resolveSessionKey,
+  materializeSessionRoot,
+  queueCapturedEmit,
+  resolveSessionOwnerKey,
   type HookReplayBackendState,
   type SessionLookupInput,
   type SessionState,
@@ -66,6 +68,13 @@ export type HookReplayBackendOptions = {
   agentVersion: string;
 };
 
+type PendingSubagentLineage = {
+  childSessionKey: string;
+  requesterSessionKey: string;
+  runId?: string;
+  agentId?: string;
+};
+
 /** Replays OpenClaw public hook events into NeMo Relay scopes, spans, and marks. */
 export class HookReplayBackend {
   private readonly nf: NemoRelayRuntimeModule;
@@ -74,6 +83,8 @@ export class HookReplayBackend {
   private readonly agentVersion: string;
   private readonly stateValue = createHookReplayState();
   private readonly warningCounts = new Map<string, number>();
+  private readonly pendingSubagentLineageByChildSessionKey = new Map<string, PendingSubagentLineage>();
+  private readonly pendingSubagentChildKeyByRunId = new Map<string, string>();
 
   constructor(options: HookReplayBackendOptions) {
     this.nf = options.nf;
@@ -95,12 +106,14 @@ export class HookReplayBackend {
 
   /** Open or alias an explicit OpenClaw session root. */
   onSessionStart(event: PluginHookSessionStartEvent, ctx: PluginHookSessionContext): void {
+    const observedAtMicros = nowMicros();
     this.ensureSession({
       sessionId: event.sessionId,
       sessionKey: event.sessionKey ?? ctx.sessionKey,
       agentId: ctx.agentId,
       source: 'session_start',
       resumedFrom: event.resumedFrom,
+      timestamp: observedAtMicros,
     });
 
     // ensureSession opens the root scope and emits openclaw.session_start for both explicit and lazy sessions.
@@ -113,6 +126,7 @@ export class HookReplayBackend {
       sessionKey: event.sessionKey ?? ctx.sessionKey,
       agentId: ctx.agentId,
       source: 'lazy_session',
+      deferRootOpen: false,
     });
 
     if (!session) {
@@ -169,12 +183,14 @@ export class HookReplayBackend {
 
   /** Finalize one agent run, replaying message-write trajectory when needed. */
   onAgentEnd(event: PluginHookAgentEndEvent, ctx: PluginHookAgentContext): void {
+    const observedAtMicros = nowMicros();
     const session = this.ensureSession({
       sessionId: ctx.sessionId,
       sessionKey: ctx.sessionKey,
       runId: event.runId ?? ctx.runId,
       agentId: ctx.agentId,
       source: 'lazy_session',
+      timestamp: observedAtMicros,
     });
 
     if (!session) {
@@ -196,17 +212,20 @@ export class HookReplayBackend {
         durationMs: event.durationMs,
         messageCount: event.messages.length,
       }),
+      observedAtMicros,
     );
   }
 
   /** Remember the last assistant text before OpenClaw finalizes the response. */
   onBeforeAgentFinalize(event: PluginHookBeforeAgentFinalizeEvent, ctx: PluginHookAgentContext): void {
+    const observedAtMicros = nowMicros();
     const session = this.ensureSession({
       sessionId: event.sessionId,
       sessionKey: event.sessionKey ?? ctx.sessionKey,
       runId: event.runId ?? ctx.runId,
       agentId: ctx.agentId,
       source: 'lazy_session',
+      timestamp: observedAtMicros,
     });
 
     if (!session) {
@@ -234,21 +253,26 @@ export class HookReplayBackend {
         stopHookActive: event.stopHookActive,
         messageCount: event.messages?.length,
       }),
+      observedAtMicros,
     );
   }
 
   /** Attach subagent spawn metadata to the requester session when possible. */
   onSubagentSpawned(event: PluginHookSubagentSpawnedEvent, ctx: PluginHookSubagentContext): void {
+    const observedAtMicros = nowMicros();
+    this.trackPendingSubagentLineage(event, ctx);
     const session =
       this.ensureSession({
         requesterSessionKey: ctx.requesterSessionKey,
         source: 'lazy_session',
+        timestamp: observedAtMicros,
       }) ??
       this.ensureSession({
         childSessionKey: ctx.childSessionKey ?? event.childSessionKey,
         runId: ctx.runId ?? event.runId,
         agentId: event.agentId,
         source: 'lazy_session',
+        timestamp: observedAtMicros,
       });
 
     if (!session) {
@@ -266,25 +290,33 @@ export class HookReplayBackend {
         mode: event.mode,
         threadRequested: event.threadRequested,
       }),
+      observedAtMicros,
     );
+
+    this.promoteDeferredSubagentSession(event.childSessionKey);
   }
 
   /** Attach subagent completion metadata to the requester or child session. */
   onSubagentEnded(event: PluginHookSubagentEndedEvent, ctx: PluginHookSubagentContext): void {
+    const observedAtMicros = nowMicros();
     const session =
       this.ensureSession({
         requesterSessionKey: ctx.requesterSessionKey,
         source: 'lazy_session',
+        timestamp: observedAtMicros,
       }) ??
       this.ensureSession({
         childSessionKey: ctx.childSessionKey ?? event.targetSessionKey,
         runId: ctx.runId ?? event.runId,
         source: 'lazy_session',
+        timestamp: observedAtMicros,
       });
 
     if (!session) {
       return;
     }
+
+    this.materializeDeferredSessionRoot(session);
 
     this.emitSessionMark(
       'openclaw.subagent_ended',
@@ -300,6 +332,7 @@ export class HookReplayBackend {
         sendFarewell: event.sendFarewell,
         accountId: event.accountId,
       }),
+      observedAtMicros,
     );
   }
 
@@ -310,12 +343,12 @@ export class HookReplayBackend {
 
   /** Close one session selected by a runtime lifecycle cleanup hook. */
   async cleanupSession(input: SessionLookupInput & { reason: string }): Promise<void> {
-    const key = resolveSessionKey(this.stateValue, input);
-    if (!key) {
+    const ownerKey = resolveSessionOwnerKey(this.stateValue, input);
+    if (!ownerKey) {
       return;
     }
 
-    const session = this.stateValue.sessions.get(key);
+    const session = this.stateValue.sessions.get(ownerKey);
     if (!session) {
       return;
     }
@@ -356,6 +389,10 @@ export class HookReplayBackend {
 
   /** Emit spans/marks under the stored session scope stack and ATIF capture window. */
   emitCapturedUnderSession(label: string, session: SessionState, emit: () => void): void {
+    if (queueCapturedEmit(session, label, emit)) {
+      return;
+    }
+
     this.safeReplay(label, session, () => {
       const previousStack = this.nf.currentScopeStack();
       try {
@@ -384,16 +421,18 @@ export class HookReplayBackend {
 
   /** Drain, close, export, and delete one session. */
   private async closeSession(session: SessionState, summary: JsonRecord, metadata?: JsonRecord): Promise<void> {
+    this.materializeDeferredSessionRoot(session);
     drainSession(this.sessionManager(), session);
     closeSessionRoot(this.sessionManager(), session, summary, session.finalOutput ?? summary, metadata);
     this.flushSubscriberDelivery('session_close');
+    this.forgetPendingSubagentLineage(session);
     deleteSession(this.stateValue, session);
   }
 
   /** Emit a session-level OpenClaw lifecycle mark. */
-  private emitSessionMark(name: string, session: SessionState, data: JsonRecord): void {
+  private emitSessionMark(name: string, session: SessionState, data: JsonRecord, timestampMicros?: number): void {
     this.emitCapturedUnderSession(name, session, () => {
-      emitMark({
+      const params: Parameters<typeof emitMark>[0] = {
         nf: this.nf,
         state: this.stateValue,
         session,
@@ -407,7 +446,13 @@ export class HookReplayBackend {
           agentId: session.agentId,
           runId: typeof data.runId === 'string' ? data.runId : undefined,
         }),
-      });
+      };
+
+      if (timestampMicros !== undefined) {
+        params.timestamp = timestampMicros;
+      }
+
+      emitMark(params);
     });
   }
 
@@ -444,7 +489,125 @@ export class HookReplayBackend {
         this.replayPendingLlmOutputsForSession(session, options),
       emitUnpairedModelCallTimingMarks: (session: SessionState) => this.emitUnpairedModelCallTimingMarks(session),
       logBoundedWarn: (key: string, message: string) => this.logBoundedWarn(key, message),
+      resolveSessionRootContext: (input: Parameters<typeof ensureSession>[1]) => this.resolveSessionRootContext(input),
     };
+  }
+
+  /** Prefer nested child scopes only when the hook surface provides real subagent lineage. */
+  private resolveSessionRootContext(input: Parameters<typeof ensureSession>[1]): Partial<Parameters<typeof ensureSession>[1]> | undefined {
+    const lineage = this.resolvePendingSubagentLineage(input);
+    if (lineage) {
+      const parentSession = this.resolveTrackedSession({ requesterSessionKey: lineage.requesterSessionKey });
+      return {
+        scopeRole: 'subagent',
+        parentHandle: parentSession?.rootHandle,
+        deferRootOpen: input.deferRootOpen ?? (parentSession?.rootHandle ? false : true),
+      };
+    }
+
+    if (this.isDocumentedSubagentSessionKey(input.sessionKey ?? input.childSessionKey)) {
+      return {
+        scopeRole: 'subagent',
+        deferRootOpen: input.deferRootOpen ?? true,
+      };
+    }
+
+    return undefined;
+  }
+
+  /** Track stable parent/child lineage from subagent hooks until child session hooks can use it. */
+  private trackPendingSubagentLineage(event: PluginHookSubagentSpawnedEvent, ctx: PluginHookSubagentContext): void {
+    const requesterSessionKey = ctx.requesterSessionKey?.trim();
+    const childSessionKey = (ctx.childSessionKey ?? event.childSessionKey)?.trim();
+    if (!requesterSessionKey || !childSessionKey) {
+      return;
+    }
+
+    this.pendingSubagentLineageByChildSessionKey.set(childSessionKey, {
+      childSessionKey,
+      requesterSessionKey,
+      runId: ctx.runId ?? event.runId,
+      agentId: event.agentId,
+    });
+    if (ctx.runId ?? event.runId) {
+      this.pendingSubagentChildKeyByRunId.set(ctx.runId ?? event.runId, childSessionKey);
+    }
+  }
+
+  /** Open a deferred child session root once the requester scope is known. */
+  private promoteDeferredSubagentSession(childSessionKey: string): void {
+    const session = this.resolveTrackedSession({ sessionKey: childSessionKey, childSessionKey });
+    if (!session) {
+      return;
+    }
+
+    this.materializeDeferredSessionRoot(session);
+  }
+
+  /** Materialize one deferred session root with nested lineage when available. */
+  private materializeDeferredSessionRoot(session: SessionState): void {
+    if (session.rootHandle) {
+      return;
+    }
+
+    const lineage = this.resolvePendingSubagentLineage({
+      sessionId: session.sessionId,
+      sessionKey: session.sessionKey,
+    });
+    const parentHandle =
+      lineage === undefined
+        ? undefined
+        : this.resolveTrackedSession({ requesterSessionKey: lineage.requesterSessionKey })?.rootHandle;
+
+    materializeSessionRoot(this.sessionManager(), session, {
+      sessionId: session.sessionId,
+      sessionKey: session.sessionKey,
+      runId: lineage?.runId,
+      agentId: session.agentId ?? lineage?.agentId,
+      source: session.source,
+      resumedFrom: session.resumedFrom,
+      scopeRole: session.scopeRole,
+      parentHandle,
+    });
+  }
+
+  /** Resolve stable subagent lineage from child session key first, then run id as a fallback. */
+  private resolvePendingSubagentLineage(input: SessionLookupInput): PendingSubagentLineage | undefined {
+    const childSessionKey = [input.sessionKey, input.childSessionKey]
+      .find((value): value is string => this.isDocumentedSubagentSessionKey(value))
+      ?.trim();
+    if (childSessionKey) {
+      return this.pendingSubagentLineageByChildSessionKey.get(childSessionKey);
+    }
+
+    const runChildSessionKey =
+      typeof input.runId === 'string' && input.runId.length > 0 ? this.pendingSubagentChildKeyByRunId.get(input.runId) : undefined;
+    return runChildSessionKey === undefined ? undefined : this.pendingSubagentLineageByChildSessionKey.get(runChildSessionKey);
+  }
+
+  /** Resolve one session through the same alias map used by the replay state. */
+  private resolveTrackedSession(input: SessionLookupInput): SessionState | undefined {
+    const ownerKey = resolveSessionOwnerKey(this.stateValue, input);
+    return ownerKey === undefined ? undefined : this.stateValue.sessions.get(ownerKey);
+  }
+
+  /** Free lineage bookkeeping once the child session is closed. */
+  private forgetPendingSubagentLineage(session: SessionState): void {
+    const childSessionKey = session.sessionKey;
+    if (childSessionKey) {
+      this.pendingSubagentLineageByChildSessionKey.delete(childSessionKey);
+    }
+
+    for (const [runId, trackedChildSessionKey] of this.pendingSubagentChildKeyByRunId) {
+      if (trackedChildSessionKey === childSessionKey) {
+        this.pendingSubagentChildKeyByRunId.delete(runId);
+      }
+    }
+  }
+
+  /** Match the documented native subagent session key shape without depending on private OpenClaw internals. */
+  private isDocumentedSubagentSessionKey(value?: string): value is string {
+    return typeof value === 'string' && /^agent:[^:]+:subagent:/.test(value);
   }
 
   /** Log one warning per key to avoid noisy repeated hook failures. */
@@ -459,12 +622,12 @@ export class HookReplayBackend {
 
 export { llmKey };
 
-/** Expose session-key resolution for tests without exporting the full session module. */
-export function resolveBackendSessionKey(
+/** Expose owner-key resolution for tests without exporting the full session module. */
+export function resolveBackendSessionOwnerKey(
   state: HookReplayBackendState,
-  input: Parameters<typeof resolveSessionKey>[1],
+  input: Parameters<typeof resolveSessionOwnerKey>[1],
 ): string | undefined {
-  return resolveSessionKey(state, input);
+  return resolveSessionOwnerKey(state, input);
 }
 
 /** Build the lifecycle summary stored as the session_end mark payload. */
