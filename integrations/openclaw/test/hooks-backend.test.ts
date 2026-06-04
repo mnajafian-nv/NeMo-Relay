@@ -416,7 +416,6 @@ describe('HookReplayBackend', () => {
         {
           sessionId: 'child-session',
           sessionKey: 'agent:child-agent:subagent:child-key',
-          agentId: 'child-agent',
         },
       );
       backend.onAgentEnd(
@@ -443,6 +442,7 @@ describe('HookReplayBackend', () => {
       sessionId: 'child-session',
       sessionKey: 'agent:child-agent:subagent:child-key',
       agentId: 'child-agent',
+      runId: 'child-run',
       nemo_relay_scope_role: 'subagent',
     });
 
@@ -452,6 +452,68 @@ describe('HookReplayBackend', () => {
     assert.equal(childAgentEnd?.handle, nf.calls.pushScope[1]?.handle);
     assert.equal(spawnMark?.timestamp, 2000 * 1000);
     assert.equal(childAgentEnd?.timestamp, 4000 * 1000);
+  });
+
+  it('keeps session_start-first child activity on the existing child scope after subagent_spawned', () => {
+    const nf = createNemoRelayRuntime();
+    const backend = createBackend(nf);
+
+    withMockedNow([1000, 2000, 3000, 4000], () => {
+      backend.onSessionStart(
+        { sessionId: 'parent-session', sessionKey: 'parent-key' },
+        { sessionId: 'parent-session', sessionKey: 'parent-key' },
+      );
+      backend.onSessionStart(
+        { sessionId: 'child-session', sessionKey: 'agent:child-agent:subagent:child-key' },
+        {
+          sessionId: 'child-session',
+          sessionKey: 'agent:child-agent:subagent:child-key',
+        },
+      );
+      backend.onSubagentSpawned(
+        {
+          childSessionKey: 'agent:child-agent:subagent:child-key',
+          agentId: 'child-agent',
+          mode: 'run',
+          threadRequested: false,
+          runId: 'child-run',
+        },
+        {
+          requesterSessionKey: 'parent-key',
+          childSessionKey: 'agent:child-agent:subagent:child-key',
+          runId: 'child-run',
+        },
+      );
+      backend.onAgentEnd(
+        {
+          runId: 'child-run',
+          messages: [{ role: 'assistant', provider: 'openai', model: 'gpt', content: 'Child answer.' }],
+          success: true,
+        },
+        {
+          runId: 'child-run',
+        },
+      );
+    });
+
+    assert.equal(nf.calls.pushScope.length, 2);
+    assert.equal(nf.calls.pushScope[1]?.parentHandle, nf.calls.pushScope[0]?.handle);
+    assert.equal(nf.calls.pushScope[1]?.timestamp, 2000 * 1000);
+    assert.deepEqual(nf.calls.pushScope[1]?.metadata, {
+      source: 'openclaw.session_start',
+      hook_event_name: 'session_start',
+      sessionId: 'child-session',
+      sessionKey: 'agent:child-agent:subagent:child-key',
+      agentId: 'child-agent',
+      runId: 'child-run',
+      nemo_relay_scope_role: 'subagent',
+    });
+
+    const childAgentEndEvents = nf.calls.event.filter(
+      (event) => event.name === 'openclaw.agent_end' && event.handle === nf.calls.pushScope[1]?.handle,
+    );
+    assert.equal(childAgentEndEvents.length, 1);
+    assert.equal(childAgentEndEvents[0]?.timestamp, 4000 * 1000);
   });
 
   it('reconciles a deferred child session with later session_start before lineage promotion', () => {

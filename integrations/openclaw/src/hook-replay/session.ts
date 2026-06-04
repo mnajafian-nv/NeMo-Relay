@@ -161,6 +161,24 @@ export type SessionManager = {
   resolveSessionRootContext?: (input: EnsureSessionInput) => Partial<EnsureSessionInput> | undefined;
 };
 
+/** Merge lineage/root-context defaults without letting undefined hook fields erase them. */
+function mergeEnsureSessionInput(
+  input: EnsureSessionInput,
+  context: Partial<EnsureSessionInput> | undefined,
+): EnsureSessionInput {
+  if (!context) {
+    return input;
+  }
+
+  const merged: Record<string, unknown> = { ...context, ...input };
+  for (const [key, value] of Object.entries(context)) {
+    if (merged[key] === undefined && value !== undefined) {
+      merged[key] = value;
+    }
+  }
+  return merged as EnsureSessionInput;
+}
+
 /** Return the session key that belongs to the session itself, not a requester alias. */
 function ownSessionKey(input: SessionLookupInput): string | undefined {
   return input.sessionKey ?? input.childSessionKey;
@@ -224,10 +242,7 @@ export function createHookReplayState(): HookReplayBackendState {
 
 /** Return an existing session or lazily create a root session scope for replay. */
 export function ensureSession(manager: SessionManager, input: EnsureSessionInput): SessionState | undefined {
-  const resolvedInput = {
-    ...(manager.resolveSessionRootContext?.(input) ?? {}),
-    ...input,
-  };
+  const resolvedInput = mergeEnsureSessionInput(input, manager.resolveSessionRootContext?.(input));
   const ownerKey = resolveSessionOwnerKey(manager.state, resolvedInput);
   if (!ownerKey) {
     manager.state.counters.skippedEvents += 1;
@@ -387,6 +402,8 @@ export function materializeSessionRoot(manager: SessionManager, session: Session
   if (session.rootHandle) {
     return;
   }
+
+  enrichSession(session, input);
 
   const timestampMicros = input.timestamp ?? session.pendingRootTimestampMicros ?? null;
   const rootRunId = input.runId ?? session.pendingRootRunId;

@@ -499,6 +499,9 @@ export class HookReplayBackend {
     if (lineage) {
       const parentSession = this.resolveTrackedSession({ requesterSessionKey: lineage.requesterSessionKey });
       return {
+        childSessionKey: input.childSessionKey ?? lineage.childSessionKey,
+        runId: input.runId ?? lineage.runId,
+        agentId: input.agentId ?? lineage.agentId,
         scopeRole: 'subagent',
         parentHandle: parentSession?.rootHandle,
         deferRootOpen: input.deferRootOpen ?? (parentSession?.rootHandle ? false : true),
