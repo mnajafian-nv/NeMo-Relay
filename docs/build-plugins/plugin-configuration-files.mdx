@@ -206,10 +206,8 @@ Tables inside component config merge recursively.
 
 ## Configuration Layering
 
-Plugin settings can come from files and the code. The files are the
-configuration base layer and the code sits on top of it. If there is a
-conflict, the code will always take precedence over the files. The layering
-process is as follows:
+Plugin settings come from files and code. Files form the base layer; code sits
+on top. When the two conflict, code wins. Layering works as follows:
 
 1. Discover and merge the `plugins.toml` files from lowest to highest precedence
    (system → project → user), using the [Precedence And Merge Behavior](#precedence-and-merge-behavior) rules above.
@@ -224,10 +222,10 @@ Files and code differ only in how they treat a setting you **omit**:
 | `version`, `policy`, or the `enabled` flag of a component you declare | Inherited from a lower-precedence file | **Always taken from code** — its default if you did not set it |
 | A whole component kind, or a key inside a component's `config` | Inherited from a lower-precedence file | Inherited from the file layer |
 
-In other words, a file's gaps are filled by the layers beneath it, but code's
-typed fields are never gaps — they always carry a value, so they always take precedence.
-Only the open-ended parts of your code config (which components you include, and
-the keys within each component's `config`) merge with the files.
+The layers beneath a file fill its gaps. Code's typed fields are never gaps —
+they always carry a value, so they always take precedence. Only the open-ended
+parts of your code config — which components you include, and the keys within
+each component's `config` — merge with the files.
 
 Without a filesystem — for example, a WebAssembly (wasm) build — no files are
 read, so the base is empty and only your `initialize` config applies.
