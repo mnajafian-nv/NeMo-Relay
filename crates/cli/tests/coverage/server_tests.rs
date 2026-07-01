@@ -170,6 +170,40 @@ fn test_config() -> GatewayConfig {
     }
 }
 
+#[test]
+fn startup_status_reports_bound_gateway_and_exporters() {
+    let config = GatewayConfig {
+        plugin_config: Some(json!({
+            "version": 1,
+            "components": [{
+                "kind": "observability",
+                "enabled": true,
+                "config": {
+                    "version": 1,
+                    "opentelemetry": {
+                        "enabled": true,
+                        "endpoint": "http://127.0.0.1:4318/v1/traces"
+                    }
+                }
+            }]
+        })),
+        ..test_config()
+    };
+
+    let output = render_startup_status("127.0.0.1:4567".parse().unwrap(), &config, false);
+
+    assert!(output.contains("NeMo Relay"));
+    assert!(output.contains("Gateway        http://127.0.0.1:4567"));
+    assert!(output.contains("OpenTelemetry http://127.0.0.1:4318/v1/traces"));
+}
+
+#[test]
+fn startup_status_reports_not_configured_when_no_exporters() {
+    let output = render_startup_status("127.0.0.1:4567".parse().unwrap(), &test_config(), false);
+
+    assert!(output.contains("Exporters      not configured"));
+}
+
 fn write_missing_native_plugin_manifest(
     dir: &std::path::Path,
     plugin_id: &str,
