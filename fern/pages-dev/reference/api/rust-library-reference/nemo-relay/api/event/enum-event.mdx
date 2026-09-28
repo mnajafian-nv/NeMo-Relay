@@ -143,6 +143,30 @@ Return the synthetic parent imported with the propagation context.
 
 Attach the synthetic parent captured at event emission.
 
+#### `propagation_traceparent`
+
+<pre className="rust-signature"><code dangerouslySetInnerHTML={{"__html": "pub fn propagation_traceparent(&amp;self) -&gt; <a href=\"https://doc.rust-lang.org/1.96.1/core/option/enum.Option.html\">Option</a>&lt;&amp;<a href=\"https://doc.rust-lang.org/1.96.1/std/primitive.str.html\">str</a>&gt;"}} /></pre>
+
+Return W3C traceparent captured when this event was emitted.
+
+#### `set_propagation_traceparent`
+
+<pre className="rust-signature"><code dangerouslySetInnerHTML={{"__html": "pub fn set_propagation_traceparent(&amp;mut self, traceparent: <a href=\"https://doc.rust-lang.org/1.96.1/core/option/enum.Option.html\">Option</a>&lt;<a href=\"https://doc.rust-lang.org/1.96.1/alloc/string/struct.String.html\">String</a>&gt;)"}} /></pre>
+
+Attach runtime-only W3C traceparent lineage.
+
+#### `propagation_tracestate`
+
+<pre className="rust-signature"><code dangerouslySetInnerHTML={{"__html": "pub fn propagation_tracestate(&amp;self) -&gt; <a href=\"https://doc.rust-lang.org/1.96.1/core/option/enum.Option.html\">Option</a>&lt;&amp;<a href=\"https://doc.rust-lang.org/1.96.1/std/primitive.str.html\">str</a>&gt;"}} /></pre>
+
+Return W3C tracestate captured when this event was emitted.
+
+#### `set_propagation_tracestate`
+
+<pre className="rust-signature"><code dangerouslySetInnerHTML={{"__html": "pub fn set_propagation_tracestate(&amp;mut self, tracestate: <a href=\"https://doc.rust-lang.org/1.96.1/core/option/enum.Option.html\">Option</a>&lt;<a href=\"https://doc.rust-lang.org/1.96.1/alloc/string/struct.String.html\">String</a>&gt;)"}} /></pre>
+
+Attach runtime-only W3C tracestate lineage.
+
 #### `uuid`
 
 <pre className="rust-signature"><code dangerouslySetInnerHTML={{"__html": "pub fn uuid(&amp;self) -&gt; <a href=\"https://docs.rs/uuid/1.18.1/uuid/struct.Uuid.html\">Uuid</a>"}} /></pre>
@@ -294,6 +318,16 @@ Return the runtime-only annotated LLM response.
 ##### Returns
 
 `Some` annotated response when the event profile includes one.
+
+#### `time_to_first_chunk`
+
+<pre className="rust-signature"><code dangerouslySetInnerHTML={{"__html": "pub fn time_to_first_chunk(&amp;self) -&gt; <a href=\"https://doc.rust-lang.org/1.96.1/core/option/enum.Option.html\">Option</a>&lt;<a href=\"https://doc.rust-lang.org/1.96.1/std/primitive.f64.html\">f64</a>&gt;"}} /></pre>
+
+Return the managed stream time to first received chunk, in seconds.
+
+##### Returns
+
+The measured duration on streaming LLM end events, when at least one chunk reached the managed stream wrapper.
 
 #### `is_scope_start`
 
